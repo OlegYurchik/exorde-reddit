@@ -4,9 +4,9 @@ import dataclasses
 import json
 import logging
 from datetime import datetime
-from typing import Any, Awaitable, List
+from typing import Any, Callable, List
 
-from playwright.async_api import async_playwright, Browser, ElementHandle, Page, TimeoutError
+from playwright.async_api import async_playwright, Browser, ElementHandle, Page
 
 
 @dataclasses.dataclass
@@ -25,12 +25,61 @@ class RedditPost:
     comments: List[RedditComment]
 
 
-async def with_semaphore(function: Awaitable, semaphore: asyncio.Semaphore) -> Any:
-    async with semaphore:
-        try:
-            return await function
-        except:
-            pass
+def with_page(browser: Browser) -> Callable:
+    def decorator(function: Callable) -> Callable:
+        async def wrapper(*args, **kwargs) -> Any:
+            page = await browser.new_page()
+            try:
+                return await function(page=page, *args, **kwargs)
+            finally:
+                await page.close()
+
+        return wrapper
+    return decorator
+
+
+def with_semaphore(semaphore: asyncio.Semaphore) -> Callable:
+    def decorator(function: Callable) -> Callable:
+        async def wrapper(*args, **kwargs) -> Any:
+            async with semaphore:
+                return await function(*args, **kwargs)
+
+        return wrapper
+    return decorator
+
+
+def retry(logger: logging.Logger, max_attempts: int = 1) -> Any:
+    def decorator(function: Callable) -> Callable:
+        async def wrapper(*args, **kwargs) -> Any:
+            if max_attempts < 1:
+                raise Exception("Argument 'max_attempts' must be poritive")
+
+            attempt = 0
+            exception = None
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    return await function(*args, **kwargs)
+                except Exception as exc:
+                    logger.warning("Attempt=%d; Error: %s", attempt, exc)
+                    exception = exc
+            
+            raise exception
+        
+        return wrapper
+    return decorator
+
+
+def stop_raise(logger: logging.Logger) -> Callable:
+    def decorator(function: Callable) -> Callable:
+        async def wrapper(*args, **kwargs) -> Any:
+            try:
+                return await function(*args, **kwargs)
+            except Exception as exc:
+                logger.error("Get exception: %s", exc)
+        
+        return wrapper
+    return decorator
 
 
 class RedditScrapper:
@@ -43,18 +92,23 @@ class RedditScrapper:
     POST_CREATED_AT_POPUP_SELECTOR: str = (
         "._2J_zB4R1FH2EjGMkQjedwc.u6HtAZu8_LKL721-EnKuR[data-popper-reference-hidden='false']"
     )
-    POST_SCROLL_TRIES: int = 5
 
     COMMENT_SELECTOR: str = "._3sf33-9rVAO_v4y0pIW_CH"
     COMMENT_TEXT_SELECTOR: str = "._1qeIAgB0cPwnLhDF9XSiJM"
     COMMENT_CREATED_AT_SELECTOR: str = "._3yx4Dn0W3Yunucf5sVJeFU"
-    COMMENT_CREATED_AT_POPUP_SELECTOR: str = (
-        "._2J_zB4R1FH2EjGMkQjedwc.u6HtAZu8_LKL721-EnKuR[data-popper-reference-hidden='false']"
-    )
-    COMMENT_SCROLL_TRIES: int = 5
+    COMMENT_CREATED_AT_POPUP_SELECTOR: str = ".HQ2VJViRjokXpRbJzPvvc"
 
+    SCROLL_TRIES: int = 3
     SCROLL_DELAY_SECONDS: float = 5
-    MAX_CONCURRENT_TASK: int = 5
+    MAX_CONCURRENT_TASK: int = 1
+    TIMEOUT_MS: int = 10000
+
+    @staticmethod
+    def to_isoformat(value: str) -> str:
+        result = " ".join(value.split()[:-3])
+        result = datetime.strptime(result, "%a, %b %d, %Y, %I:%M:%S %p").isoformat()
+
+        return result
 
     def __init__(self, *keywords: str, debug: bool = False):
         self.browser: Browser | None = None
@@ -66,11 +120,13 @@ class RedditScrapper:
     async def run(self) -> List[RedditPost]:
         async with async_playwright() as playwright:
             self.browser = await playwright.chromium.launch()
-            return await self.search()
+            
+            coroutine = self.search
+            coroutine = with_page(browser=self.browser)(coroutine)
+            return await coroutine()
 
-    async def search(self) -> List[RedditPost]:
-        page = await self.browser.new_page()
-        await page.goto(f"{self.BASE_URL}/search?q={self.query}")
+    async def search(self, page: Page) -> List[RedditPost]:
+        await page.goto(url=f"{self.BASE_URL}/search?q={self.query}")
         self.logger.debug("Load search page.")
 
         posts = []
@@ -79,7 +135,7 @@ class RedditScrapper:
         have_new_posts = True
         tries = 0
 
-        while have_new_posts or tries < self.POST_SCROLL_TRIES:
+        while have_new_posts or tries < self.SCROLL_TRIES:
             if not have_new_posts:
                 self.logger.debug("Have no found new posts, attempt %d", tries + 1)
 
@@ -89,22 +145,28 @@ class RedditScrapper:
             element_handles = await page.locator(self.POST_SELECTOR).element_handles()
             element_handles = element_handles[len(posts):]
             for element_handle in element_handles:
-                await element_handle.scroll_into_view_if_needed()
+                await element_handle.scroll_into_view_if_needed(timeout=self.TIMEOUT_MS)
 
-                post = await self.parse_post(page=page, element_handle=element_handle)
-                if post.id in post_ids:
-                    self.logger.warning("Post %s already scrapped.", post.id)
+                coroutine = self.parse_post
+                coroutine = stop_raise(logger=self.logger)(coroutine)
+                post = await coroutine(page=page, element_handle=element_handle)
+                if post is None:
+                    self.logger.error("Cannot parse post")
+                    continue
+                if (post.subreddit, post.id) in post_ids:
+                    self.logger.warning("Post (%s, %s) already scrapped.", post.subreddit, post.id)
                     continue
 
                 tries = 0
                 have_new_posts = True
-                post_ids.add(post.id)
+                post_ids.add((post.subreddit, post.id))
                 posts.append(post)
 
-                task = asyncio.create_task(with_semaphore(
-                    function=self.search_comments(post=post),
-                    semaphore=self.semaphore,
-                ))
+                coroutine = self.search_comments
+                coroutine = with_page(browser=self.browser)(coroutine)
+                coroutine = retry(logger=self.logger, max_attempts=3)(coroutine)
+                coroutine = with_semaphore(semaphore=self.semaphore)(coroutine)
+                task = asyncio.create_task(coroutine(post=post))
                 tasks.append(task)
         
             self.logger.info("Found %d reddit posts.", len(posts))
@@ -114,7 +176,6 @@ class RedditScrapper:
         if tasks:
             await asyncio.wait(tasks)
         self.logger.info("All comments loaded.")
-        await page.close()
         return posts
 
     async def parse_post(self, page: Page, element_handle: ElementHandle) -> RedditPost:
@@ -128,12 +189,11 @@ class RedditScrapper:
         title = await title.inner_text()
 
         created_at_element = await element_handle.query_selector(self.POST_CREATED_AT_SELECTOR)
-        await created_at_element.hover()
-        await page.wait_for_selector(self.POST_CREATED_AT_POPUP_SELECTOR)
+        await created_at_element.hover(timeout=self.TIMEOUT_MS)
+        await page.wait_for_selector(self.POST_CREATED_AT_POPUP_SELECTOR, timeout=self.TIMEOUT_MS)
         created_at = await page.locator(self.POST_CREATED_AT_POPUP_SELECTOR).element_handle()
         created_at = await created_at.inner_text()
-        created_at = " ".join(created_at.split()[:-3])
-        created_at = datetime.strptime(created_at, "%a, %b %d, %Y, %I:%M:%S %p").isoformat()
+        created_at = self.to_isoformat(value=created_at)
 
         return RedditPost(
             id=id,
@@ -143,9 +203,8 @@ class RedditScrapper:
             comments=[],
         )
 
-    async def search_comments(self, post: RedditPost) -> List[RedditComment]:
-        page = await self.browser.new_page()
-        await page.goto(f"{self.BASE_URL}/{post.subreddit}/comments/{post.id}")
+    async def search_comments(self, page: Page, post: RedditPost) -> List[RedditComment]:
+        await page.goto(url=f"{self.BASE_URL}/{post.subreddit}/comments/{post.id}")
         self.logger.debug("Load post page: subreddit=%s; id=%s.", post.subreddit, post.id)
 
         comments = []
@@ -153,7 +212,7 @@ class RedditScrapper:
         have_new_comments = True
         tries = 0
 
-        while have_new_comments or tries < self.COMMENT_SCROLL_TRIES:
+        while have_new_comments or tries < self.SCROLL_TRIES:
             if not have_new_comments:
                 self.logger.debug(
                     "Have no found new comments for post (subreddit=%s; id=%s), attempt %d",
@@ -168,11 +227,25 @@ class RedditScrapper:
             element_handles = await page.locator(self.COMMENT_SELECTOR).element_handles()
             element_handles = element_handles[len(comments):]
             for element_handle in element_handles:
-                await element_handle.scroll_into_view_if_needed()
+                await element_handle.scroll_into_view_if_needed(timeout=self.TIMEOUT_MS)
 
-                comment = await self.parse_comment(page=page, element_handle=element_handle)
+                coroutine = self.parse_comment
+                coroutine = stop_raise(logger=self.logger)(coroutine)
+                comment = await coroutine(page=page, element_handle=element_handle)
+                if comment is None:
+                    self.logger.error(
+                        "Cannot parse comment on (subreddit=%s; id=%s) post",
+                        post.subreddit,
+                        post.id,
+                    )
+                    continue
                 if comment.id in comment_ids:
-                    self.logger.warning("Comment %s already scrapped.", comment.id)
+                    self.logger.warning(
+                        "Comment (subreddit=%s; post_id=%s, id=%s) already scrapped.",
+                        post.subreddit,
+                        post.id,
+                        comment.id,
+                    )
                     continue
 
                 tries = 0
@@ -184,7 +257,6 @@ class RedditScrapper:
                              post.subreddit, post.id)
             await asyncio.sleep(self.SCROLL_DELAY_SECONDS)
 
-        await page.close()
         post.comments = comments
         return comments
 
@@ -196,18 +268,20 @@ class RedditScrapper:
         text = "" if text is None else await text.inner_text()
 
         created_at_element = await element_handle.query_selector(self.COMMENT_CREATED_AT_SELECTOR)
-        await created_at_element.hover()
-        await page.wait_for_selector(self.COMMENT_CREATED_AT_POPUP_SELECTOR)
+        await created_at_element.hover(timeout=self.TIMEOUT_MS)
+        await page.wait_for_selector(
+            self.COMMENT_CREATED_AT_POPUP_SELECTOR,
+            timeout=self.TIMEOUT_MS,
+        )
         created_at = await page.locator(self.COMMENT_CREATED_AT_POPUP_SELECTOR).element_handle()
         created_at = await created_at.inner_text()
-        created_at = " ".join(created_at.split()[:-3])
-        created_at = datetime.strptime(created_at, "%a, %b %d, %Y, %I:%M:%S %p").isoformat()
+        created_at = self.to_isoformat(value=created_at)
 
         return RedditComment(id=id, text=text, created_at=created_at)
 
 
-def run(start_datetime: int, *keywords: str) -> str:
-    scrapper = RedditScrapper(*keywords)
+def run(start_datetime: int, *keywords: str, debug: bool = False) -> str:
+    scrapper = RedditScrapper(*keywords, debug=debug)
     posts = asyncio.run(scrapper.run())
     posts = [dataclasses.asdict(post) for post in posts]
 
@@ -225,6 +299,6 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", type=str, default="output.json", help="Output file name.")
     args = parser.parse_args()
 
-    output = run(1, *args.keywords)
+    output = run(1, *args.keywords, debug=True)
     with open(args.output, "wt") as output_file:
         output_file.write(output)

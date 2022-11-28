@@ -2,6 +2,10 @@
 
 Exorde network module for scrapping posts and comments from Reddit
 
+## Exorde entrypoint
+
+`exorde_reddit.py::run`
+
 ## Install
 
 ```shell
