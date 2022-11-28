@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from typing import Any, Awaitable, List
 
-from playwright.async_api import async_playwright, Browser, ElementHandle
+from playwright.async_api import async_playwright, Browser, ElementHandle, Page, TimeoutError
 
 
 @dataclasses.dataclass
@@ -40,15 +40,20 @@ class RedditScrapper:
     POST_SUBREDDIT_SELECTOR: str = "._3ryJoIoycVkA88fy40qNJc"
     POST_TITLE_SELECTOR: str = ".SQnoC3ObvgnGjWt90zD9Z"
     POST_CREATED_AT_SELECTOR: str = "._2VF2J19pUIMSLJFky-7PEI"
+    POST_CREATED_AT_POPUP_SELECTOR: str = (
+        "._2J_zB4R1FH2EjGMkQjedwc.u6HtAZu8_LKL721-EnKuR[data-popper-reference-hidden='false']"
+    )
     POST_SCROLL_TRIES: int = 5
 
-    COMMENT_SELECTOR = "._3sf33-9rVAO_v4y0pIW_CH"
-    COMMENT_TEXT_SELECTOR = "._1qeIAgB0cPwnLhDF9XSiJM"
-    COMMENT_CREATED_AT_SELECTOR = "._3yx4Dn0W3Yunucf5sVJeFU"
+    COMMENT_SELECTOR: str = "._3sf33-9rVAO_v4y0pIW_CH"
+    COMMENT_TEXT_SELECTOR: str = "._1qeIAgB0cPwnLhDF9XSiJM"
+    COMMENT_CREATED_AT_SELECTOR: str = "._3yx4Dn0W3Yunucf5sVJeFU"
+    COMMENT_CREATED_AT_POPUP_SELECTOR: str = (
+        "._2J_zB4R1FH2EjGMkQjedwc.u6HtAZu8_LKL721-EnKuR[data-popper-reference-hidden='false']"
+    )
     COMMENT_SCROLL_TRIES: int = 5
 
-    SCROLL_SIZE_PIXELS: int = 15000
-    SCROLL_DELAY_SECONDS: float = 1
+    SCROLL_DELAY_SECONDS: float = 5
     MAX_CONCURRENT_TASK: int = 5
 
     def __init__(self, *keywords: str, debug: bool = False):
@@ -80,12 +85,15 @@ class RedditScrapper:
 
             have_new_posts = False
             tries += 1
-            await page.mouse.wheel(0, self.SCROLL_SIZE_PIXELS)
-            await asyncio.sleep(self.SCROLL_DELAY_SECONDS)
 
-            for element_handle in await page.locator(self.POST_SELECTOR).element_handles():
-                post = await self.parse_post(element_handle=element_handle)
+            element_handles = await page.locator(self.POST_SELECTOR).element_handles()
+            element_handles = element_handles[len(posts):]
+            for element_handle in element_handles:
+                await element_handle.scroll_into_view_if_needed()
+
+                post = await self.parse_post(page=page, element_handle=element_handle)
                 if post.id in post_ids:
+                    self.logger.warning("Post %s already scrapped.", post.id)
                     continue
 
                 tries = 0
@@ -100,6 +108,7 @@ class RedditScrapper:
                 tasks.append(task)
         
             self.logger.info("Found %d reddit posts.", len(posts))
+            await asyncio.sleep(self.SCROLL_DELAY_SECONDS)
 
         self.logger.info("All posts loaded.")
         if tasks:
@@ -108,7 +117,7 @@ class RedditScrapper:
         await page.close()
         return posts
 
-    async def parse_post(self, element_handle: ElementHandle) -> RedditPost:
+    async def parse_post(self, page: Page, element_handle: ElementHandle) -> RedditPost:
         id = await element_handle.get_attribute("id")
         id = id.lstrip("t3_")
         
@@ -117,16 +126,20 @@ class RedditScrapper:
 
         title = await element_handle.query_selector(self.POST_TITLE_SELECTOR)
         title = await title.inner_text()
-        
-        # TODO: Getting correct created_at
-        created_at = await element_handle.query_selector(self.POST_CREATED_AT_SELECTOR)
 
-        # TODO: created_at it is not correct, need get this value from element_handler
+        created_at_element = await element_handle.query_selector(self.POST_CREATED_AT_SELECTOR)
+        await created_at_element.hover()
+        await page.wait_for_selector(self.POST_CREATED_AT_POPUP_SELECTOR)
+        created_at = await page.locator(self.POST_CREATED_AT_POPUP_SELECTOR).element_handle()
+        created_at = await created_at.inner_text()
+        created_at = " ".join(created_at.split()[:-3])
+        created_at = datetime.strptime(created_at, "%a, %b %d, %Y, %I:%M:%S %p").isoformat()
+
         return RedditPost(
             id=id,
             title=title,
             subreddit=subreddit,
-            created_at=datetime.now().isoformat(),
+            created_at=created_at,
             comments=[],
         )
 
@@ -151,12 +164,15 @@ class RedditScrapper:
 
             have_new_comments = False
             tries += 1
-            await page.mouse.wheel(0, self.SCROLL_SIZE_PIXELS)
-            await asyncio.sleep(self.SCROLL_DELAY_SECONDS)
 
-            for element_handle in await page.locator(self.COMMENT_SELECTOR).element_handles():
-                comment = await self.parse_comment(element_handle=element_handle)
+            element_handles = await page.locator(self.COMMENT_SELECTOR).element_handles()
+            element_handles = element_handles[len(comments):]
+            for element_handle in element_handles:
+                await element_handle.scroll_into_view_if_needed()
+
+                comment = await self.parse_comment(page=page, element_handle=element_handle)
                 if comment.id in comment_ids:
+                    self.logger.warning("Comment %s already scrapped.", comment.id)
                     continue
 
                 tries = 0
@@ -166,23 +182,28 @@ class RedditScrapper:
 
             self.logger.info("Found %d comments for post (subreddit=%s; id=%s)", len(comments),
                              post.subreddit, post.id)
+            await asyncio.sleep(self.SCROLL_DELAY_SECONDS)
 
         await page.close()
         post.comments = comments
         return comments
 
-    async def parse_comment(self, element_handle: ElementHandle) -> RedditComment:
+    async def parse_comment(self, page: Page, element_handle: ElementHandle) -> RedditComment:
         id = await element_handle.get_attribute("id")
         id = id.lstrip("t1_")
 
         text = await element_handle.query_selector(self.COMMENT_TEXT_SELECTOR)
         text = "" if text is None else await text.inner_text()
 
-        # TODO: Getting correct created_at
-        created_at = await element_handle.query_selector(self.COMMENT_CREATED_AT_SELECTOR)
+        created_at_element = await element_handle.query_selector(self.COMMENT_CREATED_AT_SELECTOR)
+        await created_at_element.hover()
+        await page.wait_for_selector(self.COMMENT_CREATED_AT_POPUP_SELECTOR)
+        created_at = await page.locator(self.COMMENT_CREATED_AT_POPUP_SELECTOR).element_handle()
+        created_at = await created_at.inner_text()
+        created_at = " ".join(created_at.split()[:-3])
+        created_at = datetime.strptime(created_at, "%a, %b %d, %Y, %I:%M:%S %p").isoformat()
 
-        # TODO: created_at it is not correct, need get this value from element_handler
-        return RedditComment(id=id, text=text, created_at=datetime.now().isoformat())
+        return RedditComment(id=id, text=text, created_at=created_at)
 
 
 def run(start_datetime: int, *keywords: str) -> str:
@@ -194,7 +215,7 @@ def run(start_datetime: int, *keywords: str) -> str:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
 
     parser = argparse.ArgumentParser(
         prog="Exorde Reddit Scrapper",

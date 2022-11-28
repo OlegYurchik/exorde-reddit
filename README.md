@@ -1,5 +1,7 @@
 # Exorde Reddit Scrapper
 
+Exorde network module for scrapping posts and comments from Reddit
+
 ## Install
 
 ```shell
